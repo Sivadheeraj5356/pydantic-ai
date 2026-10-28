@@ -18,6 +18,7 @@ from ...messages import (
     FinishReason as PydanticFinishReason,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    ModelResponse,
     ModelSettingsDeltaEvent,
     NativeToolCallPart,
     NativeToolReturnPart,
@@ -169,17 +170,25 @@ class VercelAIEventStream(UIEventStream[RequestData, BaseChunk, AgentDepsT, Outp
         yield DoneChunk()
 
     async def handle_run_result(self, event: AgentRunResultEvent) -> AsyncIterator[BaseChunk]:
-        pydantic_reason = event.result.response.finish_reason
-        if pydantic_reason:
-            self._finish_reason = _FINISH_REASON_MAP.get(pydantic_reason, 'other')
+        # A run recovered by `on_run_error` / `wrap_run` can return a result built from `output` alone,
+        # with no model response in its messages. That is a successful run, not an error, so only
+        # read response-derived fields when there is a response.
+        response = next(
+            (m for m in reversed(event.result.all_messages()) if isinstance(m, ModelResponse)),
+            None,
+        )
+        if response is not None:
+            pydantic_reason = response.finish_reason
+            if pydantic_reason:
+                self._finish_reason = _FINISH_REASON_MAP.get(pydantic_reason, 'other')
 
-        # The AI SDK *merges* `messageMetadata` into `message.metadata` rather than replacing it.
-        # Emitting exactly one metadata chunk per run (and none at `start`) keeps merge equivalent
-        # to assignment; adding a `start`-time or mid-stream chunk would need the merge revisited.
-        # Request-side messages have no analogous chunk — frontends that rebuild history purely
-        # from streamed chunks see timestamps only on assistant responses, whereas `dump_messages`
-        # populates both sides.
-        yield MessageMetadataChunk(message_metadata=dump_message_metadata(event.result.response))
+            # The AI SDK *merges* `messageMetadata` into `message.metadata` rather than replacing it.
+            # Emitting exactly one metadata chunk per run (and none at `start`) keeps merge equivalent
+            # to assignment; adding a `start`-time or mid-stream chunk would need the merge revisited.
+            # Request-side messages have no analogous chunk — frontends that rebuild history purely
+            # from streamed chunks see timestamps only on assistant responses, whereas `dump_messages`
+            # populates both sides.
+            yield MessageMetadataChunk(message_metadata=dump_message_metadata(response))
 
         # Emit tool approval requests for deferred approvals (only when sdk_version >= 6)
         output = event.result.output
